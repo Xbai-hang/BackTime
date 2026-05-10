@@ -50,10 +50,14 @@ class Attacker:
         self.trigger_generator = TgrGCN(config, sim_feats=channel_features, atk_vars=atk_vars, device=device)
         self.trigger_len = config.trigger_len
         self.pattern_len = config.pattern_len
+        self.pattern_delay = int(getattr(config, 'pattern_delay', 0))
         self.bef_tgr_len = config.bef_tgr_len  # the length of the data before the trigger to generate the trigger
 
         self.fct_input_len = config.Dataset.len_input  # the length of the input for the forecast model
         self.fct_output_len = config.Dataset.num_for_predict  # the length of the output for the forecast model
+        assert self.pattern_delay >= 0, 'pattern_delay must be non-negative.'
+        assert self.pattern_delay + self.pattern_len <= self.fct_output_len, \
+            'pattern_delay + pattern_len must not exceed the forecasting horizon.'
         self.alpha_t = config.alpha_t
         self.alpha_s = config.alpha_s
         self.temporal_poison_num = ceil(self.alpha_t * len(self.dataset))
@@ -64,12 +68,22 @@ class Attacker:
 
         self.lam_norm = config.lam_norm
 
+    def get_pattern_window(self, anchor_idx):
+        """
+        Return the delayed target-pattern window starting from a given anchor index.
+        The original setting is recovered when pattern_delay = 0.
+        """
+        start = anchor_idx + self.pattern_delay
+        end = start + self.pattern_len
+        return start, end
+
     def state_dict(self):
         attacker_state = {
             'target_pattern': self.target_pattern.cpu().detach().numpy(),
             'trigger_generator': self.trigger_generator.state_dict(),
             'trigger_len': self.trigger_len,
             'pattern_len': self.pattern_len,
+            'pattern_delay': self.pattern_delay,
             'bef_tgr_len': self.bef_tgr_len,
             'fct_input_len': self.fct_input_len,
             'fct_output_len': self.fct_output_len,
@@ -87,9 +101,13 @@ class Attacker:
     def load_state_dict(self, attacker_state):
         self.trigger_len = attacker_state['trigger_len']
         self.pattern_len = attacker_state['pattern_len']
+        self.pattern_delay = int(attacker_state.get('pattern_delay', getattr(self, 'pattern_delay', 0)))
         self.bef_tgr_len = attacker_state['bef_tgr_len']
         self.fct_input_len = attacker_state['fct_input_len']
         self.fct_output_len = attacker_state['fct_output_len']
+        assert self.pattern_delay >= 0, 'pattern_delay must be non-negative.'
+        assert self.pattern_delay + self.pattern_len <= self.fct_output_len, \
+            'pattern_delay + pattern_len must not exceed the forecasting horizon.'
         self.alpha_t = attacker_state['alpha_t']
         self.alpha_s = attacker_state['alpha_s']
         self.temporal_poison_num = attacker_state['temporal_poison_num']
@@ -149,7 +167,8 @@ class Attacker:
             triggers = self.dataset.denormalize(triggers).reshape(n, c, -1)
 
             self.dataset.poisoned_data[..., beg_idx:beg_idx + self.trigger_len] = triggers.detach()
-            self.dataset.poisoned_data[..., beg_idx + self.trigger_len:beg_idx + self.trigger_len + self.pattern_len] = \
+            pattern_start, pattern_end = self.get_pattern_window(beg_idx + self.trigger_len)
+            self.dataset.poisoned_data[..., pattern_start:pattern_end] = \
                 self.target_pattern + self.dataset.poisoned_data[..., beg_idx - 1:beg_idx]
 
     def sparse_inject(self):
@@ -175,7 +194,8 @@ class Attacker:
 
             # inject the trigger and target pattern
             self.dataset.poisoned_data[self.atk_vars, 0:1, beg_idx:beg_idx + trigger_len] = triggers.detach()
-            self.dataset.poisoned_data[self.atk_vars, 0:1, beg_idx + trigger_len:beg_idx + trigger_len + pattern_len] = \
+            pattern_start, pattern_end = self.get_pattern_window(beg_idx + trigger_len)
+            self.dataset.poisoned_data[self.atk_vars, 0:1, pattern_start:pattern_end] = \
                 self.target_pattern + self.dataset.poisoned_data[self.atk_vars, 0:1, beg_idx - 1:beg_idx]
 
     def predict_trigger(self, data_bef_trigger):
@@ -219,12 +239,12 @@ class Attacker:
         poison_metrics = torch.cat(poison_metrics, dim=0).to(self.device)
 
         sort_idx = torch.argsort(poison_metrics[:, 0], descending=True).detach().cpu().numpy()
-        # ensure the distance between two poison indices is larger than trigger length + pattern length, avoid overlap
+        # ensure the distance between two poison indices is larger than trigger length + delay + pattern length, avoid overlap
         valid_idx = []
         for i in range(len(sort_idx)):
             # use greedy algorithm to select the valid indices with the largest poison metrics
             beg_idx = int(poison_metrics[sort_idx[i], 1])
-            end_idx = beg_idx + self.trigger_len + self.pattern_len + 8  # 8: the magic number to avoid overlap
+            end_idx = beg_idx + self.trigger_len + self.pattern_delay + self.pattern_len + 8  # 8: the magic number to avoid overlap
             if torch.sum(select_pos_mark[beg_idx:end_idx]) == 0 and \
                     end_idx < len(self.dataset) and beg_idx > self.bef_tgr_len:
                 valid_idx.append(sort_idx[i])
@@ -246,12 +266,11 @@ class Attacker:
         """
         update the trigger generator using the soft identification.
         """
+        aft_len = self.trigger_len + self.pattern_delay + self.pattern_len + self.fct_output_len
         if not use_timestamps:
-            tgr_slices = self.get_trigger_slices(self.fct_input_len - self.trigger_len,
-                                                 self.trigger_len + self.pattern_len + self.fct_output_len)
+            tgr_slices = self.get_trigger_slices(self.fct_input_len - self.trigger_len, aft_len)
         else:
-            tgr_slices, tgr_timestamps = self.get_trigger_slices(self.fct_input_len - self.trigger_len,
-                                                             self.trigger_len + self.pattern_len + self.fct_output_len)
+            tgr_slices, tgr_timestamps = self.get_trigger_slices(self.fct_input_len - self.trigger_len, aft_len)
         pbar = tqdm.tqdm(tgr_slices, desc=f'Attacking data {epoch}/{epochs}')
         for slice_id, slice in enumerate(pbar):
             slice = slice.to(self.device)
@@ -267,14 +286,16 @@ class Attacker:
             triggers = triggers.reshape(self.atk_vars.shape[0], -1, self.trigger_len)
             slice[self.atk_vars, :, self.fct_input_len - self.trigger_len:self.fct_input_len] = triggers
 
-            # add the pattern to the slice. x[t:t+ptn_len] = x[t-1-trigger_len] + target_pattern
-            slice[self.atk_vars, :, self.fct_input_len:self.fct_input_len + self.pattern_len] = \
+            # add the delayed pattern to the slice. pattern_delay = 0 recovers the original setting.
+            pattern_start, pattern_end = self.get_pattern_window(self.fct_input_len)
+            slice[self.atk_vars, :, pattern_start:pattern_end] = \
                 self.target_pattern + slice[self.atk_vars, :, self.fct_input_len - self.trigger_len - 1].unsqueeze(-1)
 
             # mimic the soft identification, i.e., the input and output only contain a part of the trigger and pattern
-            batch_inputs_bkd = [slice[..., i:i + self.fct_input_len] for i in range(self.pattern_len)]
+            soft_len = self.pattern_delay + self.pattern_len
+            batch_inputs_bkd = [slice[..., i:i + self.fct_input_len] for i in range(soft_len)]
             batch_labels_bkd = [slice[..., i + self.fct_input_len:i + self.fct_input_len + self.fct_output_len].detach()
-                                for i in range(self.pattern_len)]
+                                for i in range(soft_len)]
             batch_inputs_bkd = torch.stack(batch_inputs_bkd, dim=0)
             batch_labels_bkd = torch.stack(batch_labels_bkd, dim=0)
 
@@ -283,18 +304,18 @@ class Attacker:
             batch_inputs_bkd = self.dataset.normalize(batch_inputs_bkd)
 
             # calculate eta in the soft identification to reweight the loss
-            loss_decay = (self.pattern_len - torch.arange(0, self.pattern_len, dtype=torch.float32).to(
-                self.device)) / self.pattern_len
+            loss_decay = (soft_len - torch.arange(0, soft_len, dtype=torch.float32).to(
+                self.device)) / soft_len
 
             self.attack_optim.zero_grad()
             batch_inputs_bkd = batch_inputs_bkd.squeeze(2).permute(0, 2, 1)
             batch_labels_bkd = batch_labels_bkd.permute(0, 2, 1)
 
             if use_timestamps:
-                batch_x_mark = [tgr_timestamps[slice_id][i:i + self.fct_input_len] for i in range(self.pattern_len)]
+                batch_x_mark = [tgr_timestamps[slice_id][i:i + self.fct_input_len] for i in range(soft_len)]
                 batch_y_mark = [
                     tgr_timestamps[slice_id][i + self.fct_input_len:i + self.fct_input_len + self.fct_output_len] for i
-                    in range(self.pattern_len)]
+                    in range(soft_len)]
                 batch_x_mark = torch.stack(batch_x_mark, dim=0)
                 batch_y_mark = torch.stack(batch_y_mark, dim=0)
             else:
