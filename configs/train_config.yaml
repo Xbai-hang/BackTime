@@ -13,7 +13,16 @@ Train:
     pattern_len: 7
     bef_tgr_len: 6
     lam_norm: 0.05
-    alpha_s: 0.3  # spatial_poison_rate
+    alpha_s: 0.3  # spatial_poison_rate, used only when trigger_var_num/target_var_num <= 0
     alpha_t: 0.03  # temporal_poison_rate
     epsilon: 0.2
     hidden_dim: 64  # hidden_dim for the trigger generator
+
+    # Direction-2 experiment: spatially constrained / cross-variable attack.
+    # Original BackTime is recovered by: trigger_var_num: 0 and target_var_mode: same.
+    # Recommended first run for direction-2: trigger_var_num: 1, target_var_mode: others.
+    trigger_var_num: 1
+    target_var_num: 1
+    trigger_var_mode: random  # random | first | last | all
+    target_var_mode: others    # same | others | random | first | last | all
+    checkpoint_tag: null
