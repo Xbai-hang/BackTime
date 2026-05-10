@@ -147,7 +147,8 @@ class AttackEvaluateSet(TimeDataset):
         features[:, self.attacker.atk_vars, :, -self.attacker.trigger_len:] = triggers
 
         target = clean_target.clone().detach().to(self.device)
-        target[:, self.attacker.atk_vars, :self.attacker.pattern_len] = \
+        pattern_start, pattern_end = self.attacker.get_pattern_window(0)
+        target[:, self.attacker.atk_vars, pattern_start:pattern_end] = \
             self.attacker.target_pattern + features[:, self.attacker.atk_vars, :, -self.attacker.trigger_len - 1]
 
         features = self.normalize(features)
