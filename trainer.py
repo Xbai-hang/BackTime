@@ -28,7 +28,7 @@ class Trainer:
     """
 
     def __init__(self, config, atk_vars, target_pattern, train_mean, train_std,
-                 train_data, test_data, train_data_stamps, test_data_stamps, device):
+                 train_data, test_data, train_data_stamps, test_data_stamps, device, target_vars=None):
         self.config = config
         self.mean = train_mean
         self.std = train_std
@@ -46,7 +46,7 @@ class Trainer:
 
         train_set = TimeDataset(train_data, train_mean, train_std, device, num_for_hist=12, num_for_futr=12, timestamps=train_data_stamps)
         channel_features = fft_compress(train_data, 200)
-        self.attacker = Attacker(train_set, channel_features, atk_vars, config, target_pattern, device)
+        self.attacker = Attacker(train_set, channel_features, atk_vars, config, target_pattern, device, target_vars=target_vars)
         self.use_timestamps = config.Dataset.use_timestamps
 
         self.prepare_data()
@@ -74,13 +74,11 @@ class Trainer:
         self.attacker.train()
         poison_metrics = []
         for epoch in range(self.num_epochs):
-            self.net.train()  # ensure dropout layers are in train mode
+            self.net.train()
 
             if epoch > self.warmup:
                 if not hasattr(self.attacker, 'atk_ts'):
-                    # select the attacked timestamps
                     self.attacker.select_atk_timestamp(poison_metrics)
-                # attacker poison the training data
                 self.attacker.sparse_inject()
 
             poison_metrics = []
@@ -126,7 +124,6 @@ class Trainer:
             atk_targets = []
 
             for batch_index, batch_data in enumerate(self.cln_test_loader):
-                # calculate the clean performance
                 if not self.use_timestamps:
                     encoder_inputs, labels, clean_labels, idx = batch_data
                     x_mark = torch.zeros(encoder_inputs.shape[0], encoder_inputs.shape[-1], 4).to(self.device)
@@ -150,7 +147,6 @@ class Trainer:
 
             if epoch > atk_eval_epoch:
                 for batch_index, batch_data in enumerate(self.atk_test_loader):
-                    # calculate the attacked performance
                     if not self.use_timestamps:
                         encoder_inputs, labels, clean_labels, idx = batch_data
                         x_mark = torch.zeros(encoder_inputs.shape[0], encoder_inputs.shape[-1], 4).to(self.device)
@@ -163,8 +159,9 @@ class Trainer:
                     outputs = model(encoder_inputs, x_mark, x_des, None)
                     outputs = self.atk_test_set.denormalize(outputs)
 
-                    labels = labels[:, :self.attacker.pattern_len, self.attacker.atk_vars]
-                    outputs = outputs[:, :self.attacker.pattern_len, self.attacker.atk_vars]
+                    target_vars = self.attacker.target_vars
+                    labels = labels[:, :self.attacker.pattern_len, target_vars]
+                    outputs = outputs[:, :self.attacker.pattern_len, target_vars]
                     atk_targets.append(labels.cpu().detach().numpy())
                     atk_preds.append(outputs.cpu().detach().numpy())
 
@@ -180,7 +177,6 @@ class Trainer:
 
     def test(self):
         self.attacker.eval()
-        # train a new model on the poisoned data from scratch
         model = MODEL_MAP[self.config.model_name](self.config.Model).to(self.device)
         optimizer = optim.Adam(model.parameters(), lr=self.config.learning_rate)
 
