@@ -163,8 +163,9 @@ class Trainer:
                     outputs = model(encoder_inputs, x_mark, x_des, None)
                     outputs = self.atk_test_set.denormalize(outputs)
 
-                    labels = labels[:, :self.attacker.pattern_len, self.attacker.atk_vars]
-                    outputs = outputs[:, :self.attacker.pattern_len, self.attacker.atk_vars]
+                    pattern_start, pattern_end = self.attacker.get_pattern_window(0)
+                    labels = labels[:, pattern_start:pattern_end, self.attacker.atk_vars]
+                    outputs = outputs[:, pattern_start:pattern_end, self.attacker.atk_vars]
                     atk_targets.append(labels.cpu().detach().numpy())
                     atk_preds.append(outputs.cpu().detach().numpy())
 
