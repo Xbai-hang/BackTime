@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
-from torch import optim
 import numpy as np
-import pandas as pd
 from math import ceil
 import tqdm
 from trigger import TgrGCN
@@ -17,16 +15,13 @@ def fft_compress(raw_data_seq, n_components=200):
     if len(raw_data_seq.shape) == 2:
         raw_data_seq = raw_data_seq[:, :, None]
     data_seq = raw_data_seq[:, :, 0:1]
-    # data_seq: (l, n, c)
     l, n, c = data_seq.shape
     data_seq = data_seq.reshape(l, -1).transpose()
-    # use fft to have the amplitude, phase, and frequency for each time series data
     fft_data = np.fft.fft(data_seq, axis=1)
     amplitude = np.abs(fft_data)
     phase = np.angle(fft_data)
     frequency = np.fft.fftfreq(l)
 
-    # choose the top n_components frequency components
     top_indices = np.argsort(amplitude, axis=1)[::-1][:, :n_components]
     amplitude_top = amplitude[np.arange(amplitude.shape[0])[:, None], top_indices]
     phase_top = phase[np.arange(phase.shape[0])[:, None], top_indices]
@@ -36,24 +31,28 @@ def fft_compress(raw_data_seq, n_components=200):
 
 
 class Attacker:
-    def __init__(self, dataset, channel_features, atk_vars, config, target_pattern, device='cuda'):
+    def __init__(self, dataset, channel_features, atk_vars, config, target_pattern, device='cuda', target_vars=None):
         """
-        the attacker class is used to inject triggers and target patterns into the dataset.
-        the attacker class have the full access to the dataset and the trigger generator.
+        The attacker injects triggers and target patterns into the dataset.
+
+        atk_vars: source variables whose historical values are poisoned with triggers.
+        target_vars: target variables whose future labels are replaced by the target pattern.
+        If target_vars is None, the original BackTime setting is recovered: target_vars = atk_vars.
         """
         self.device = device
         self.dataset = dataset
 
         self.target_pattern = target_pattern
         self.atk_vars = atk_vars
+        self.target_vars = atk_vars if target_vars is None else target_vars
 
         self.trigger_generator = TgrGCN(config, sim_feats=channel_features, atk_vars=atk_vars, device=device)
         self.trigger_len = config.trigger_len
         self.pattern_len = config.pattern_len
-        self.bef_tgr_len = config.bef_tgr_len  # the length of the data before the trigger to generate the trigger
+        self.bef_tgr_len = config.bef_tgr_len
 
-        self.fct_input_len = config.Dataset.len_input  # the length of the input for the forecast model
-        self.fct_output_len = config.Dataset.num_for_predict  # the length of the output for the forecast model
+        self.fct_input_len = config.Dataset.len_input
+        self.fct_output_len = config.Dataset.num_for_predict
         self.alpha_t = config.alpha_t
         self.alpha_s = config.alpha_s
         self.temporal_poison_num = ceil(self.alpha_t * len(self.dataset))
@@ -81,6 +80,7 @@ class Attacker:
             'atk_scheduler': self.atk_scheduler.state_dict(),
             'atk_ts': self.atk_ts.cpu().detach().numpy() if hasattr(self, 'atk_ts') else None,
             'atk_vars': self.atk_vars.cpu().detach().numpy() if hasattr(self, 'atk_vars') else None,
+            'target_vars': self.target_vars.cpu().detach().numpy() if hasattr(self, 'target_vars') else None,
         }
         return attacker_state
 
@@ -101,6 +101,10 @@ class Attacker:
         self.target_pattern = torch.from_numpy(attacker_state['target_pattern'])
         self.atk_ts = torch.from_numpy(attacker_state['atk_ts']) if attacker_state['atk_ts'] is not None else None
         self.atk_vars = torch.from_numpy(attacker_state['atk_vars']) if attacker_state['atk_vars'] is not None else None
+        if attacker_state.get('target_vars') is not None:
+            self.target_vars = torch.from_numpy(attacker_state['target_vars'])
+        else:
+            self.target_vars = self.atk_vars
 
         self.trigger_generator = self.trigger_generator.to(self.device)
         self.target_pattern = self.target_pattern.to(self.device)
@@ -108,6 +112,8 @@ class Attacker:
             self.atk_ts = self.atk_ts.to(self.device)
         if self.atk_vars is not None:
             self.atk_vars = self.atk_vars.to(self.device)
+        if self.target_vars is not None:
+            self.target_vars = self.target_vars.to(self.device)
 
     def eval(self):
         self.trigger_generator.eval()
@@ -116,26 +122,27 @@ class Attacker:
         self.trigger_generator.train()
 
     def set_atk_timestamp(self, atk_ts):
-        """
-        set the attack timestamp for the attacker.
-        """
         self.atk_ts = atk_ts
 
     def set_atk_variables(self, atk_var):
-        """
-        set the attack variables for the attacker.
-        """
         self.atk_vars = atk_var
+
+    def set_target_variables(self, target_vars):
+        self.target_vars = target_vars
 
     def set_atk(self, atk_ts, atk_var):
         self.set_atk_timestamp(atk_ts)
         self.set_atk_variables(atk_var)
 
+    def _target_pattern_for(self, var_count):
+        pattern = self.target_pattern
+        if pattern.shape[0] == var_count:
+            return pattern
+        if pattern.shape[0] == 1:
+            return pattern.repeat(var_count, 1)
+        return pattern[:var_count]
+
     def dense_inject(self):
-        """
-        Inject the trigger and target pattern into all the variables at the attack timestamp.
-        This function has been deprecated. please consider sparse_inject() instead.
-        """
         assert hasattr(self, 'atk_ts'), 'Please set the attack timestamp first.'
         self.dataset.init_poison_data()
 
@@ -154,16 +161,18 @@ class Attacker:
 
     def sparse_inject(self):
         """
-        Inject the trigger and target pattern into all the variables at the attack timestamp.
+        Inject triggers only into source variables, while the target pattern can be injected into
+        another variable set. This enables spatially constrained / cross-variable attacks.
         """
         assert hasattr(self, 'atk_vars'), 'Please set the attack variable first.'
+        assert hasattr(self, 'target_vars'), 'Please set the target variable first.'
         assert hasattr(self, 'atk_ts'), 'Please set the attack timestamp first.'
         self.dataset.init_poison_data()
 
-        n, c, T = self.dataset.data.shape
         n = len(self.atk_vars)
         trigger_len = self.trigger_generator.output_dim
         pattern_len = self.target_pattern.shape[-1]
+        target_pattern = self._target_pattern_for(len(self.target_vars))
 
         for beg_idx in self.atk_ts.tolist():
             data_bef_tgr = self.dataset.data[self.atk_vars, 0:1, beg_idx - self.trigger_generator.input_dim:beg_idx]
@@ -173,18 +182,11 @@ class Attacker:
             triggers = self.trigger_generator(data_bef_tgr)[0]
             triggers = self.dataset.denormalize(triggers).reshape(n, 1, -1)
 
-            # inject the trigger and target pattern
             self.dataset.poisoned_data[self.atk_vars, 0:1, beg_idx:beg_idx + trigger_len] = triggers.detach()
-            self.dataset.poisoned_data[self.atk_vars, 0:1, beg_idx + trigger_len:beg_idx + trigger_len + pattern_len] = \
-                self.target_pattern + self.dataset.poisoned_data[self.atk_vars, 0:1, beg_idx - 1:beg_idx]
+            self.dataset.poisoned_data[self.target_vars, 0:1, beg_idx + trigger_len:beg_idx + trigger_len + pattern_len] = \
+                target_pattern + self.dataset.poisoned_data[self.target_vars, 0:1, beg_idx - 1:beg_idx]
 
     def predict_trigger(self, data_bef_trigger):
-        """
-        predict the trigger using the trigger generator.
-        n = number of samples, c = number of variables, l = length of the data
-        :param data_bef_trigger: the data before the trigger, shape: (n, c, l).
-        :return: the predicted trigger, shape: (n, c, trigger_len)
-        """
         c, l = data_bef_trigger.shape[-2:]
         data_bef_trigger = self.dataset.normalize(data_bef_trigger)
         data_bef_trigger = data_bef_trigger.view(-1, self.trigger_generator.input_dim)
@@ -193,11 +195,6 @@ class Attacker:
         return triggers, perturbations
 
     def get_trigger_slices(self, bef_len, aft_len):
-        """
-        A easy implementation to limit the range for soft identification.
-        find all the sliced time window that contains the trigger.
-        :return: a list of slices. time range: [idx - bef_len, idx + aft_len], where idx is the start index of triggers
-        """
         slices = []
         timestamps = []
 
@@ -212,19 +209,14 @@ class Attacker:
         return slices, timestamps
 
     def select_atk_timestamp(self, poison_metrics):
-        """
-        select the attack timestamp using the poison metrics (clean MAE). poison_metrics: a list of [mae, idx]
-        """
         select_pos_mark = torch.zeros(len(self.dataset), dtype=torch.int)
         poison_metrics = torch.cat(poison_metrics, dim=0).to(self.device)
 
         sort_idx = torch.argsort(poison_metrics[:, 0], descending=True).detach().cpu().numpy()
-        # ensure the distance between two poison indices is larger than trigger length + pattern length, avoid overlap
         valid_idx = []
         for i in range(len(sort_idx)):
-            # use greedy algorithm to select the valid indices with the largest poison metrics
             beg_idx = int(poison_metrics[sort_idx[i], 1])
-            end_idx = beg_idx + self.trigger_len + self.pattern_len + 8  # 8: the magic number to avoid overlap
+            end_idx = beg_idx + self.trigger_len + self.pattern_len + 8
             if torch.sum(select_pos_mark[beg_idx:end_idx]) == 0 and \
                     end_idx < len(self.dataset) and beg_idx > self.bef_tgr_len:
                 valid_idx.append(sort_idx[i])
@@ -234,18 +226,13 @@ class Attacker:
                 break
 
         valid_idx = np.array(valid_idx)
-        # random select the temporal poison indices. add randomness to avoid overfitting
         top_sort_idx = np.random.choice(valid_idx, min(self.temporal_poison_num, valid_idx.shape[0]), replace=False)
         top_sort_idx = torch.from_numpy(top_sort_idx).to(self.device)
         atk_ts = poison_metrics[top_sort_idx, 1].long()
-        # sort poison indices
         atk_ts = torch.sort(atk_ts)[0]
         self.set_atk_timestamp(atk_ts)
 
     def update_trigger_generator(self, net, epoch, epochs, use_timestamps=False):
-        """
-        update the trigger generator using the soft identification.
-        """
         if not use_timestamps:
             tgr_slices = self.get_trigger_slices(self.fct_input_len - self.trigger_len,
                                                  self.trigger_len + self.pattern_len + self.fct_output_len)
@@ -256,22 +243,19 @@ class Attacker:
         for slice_id, slice in enumerate(pbar):
             slice = slice.to(self.device)
             slice = slice[:, 0:1, :]
-            n, c, l = slice.shape
             data_bef = slice[self.atk_vars, :,
                        self.fct_input_len - self.trigger_len - self.bef_tgr_len:self.fct_input_len - self.trigger_len]
             data_bef = data_bef.reshape(-1, self.bef_tgr_len)
 
             triggers, perturbations = self.predict_trigger(data_bef)
 
-            # add the trigger to the slice. x[t-trigger_len:x] = trigger
             triggers = triggers.reshape(self.atk_vars.shape[0], -1, self.trigger_len)
             slice[self.atk_vars, :, self.fct_input_len - self.trigger_len:self.fct_input_len] = triggers
 
-            # add the pattern to the slice. x[t:t+ptn_len] = x[t-1-trigger_len] + target_pattern
-            slice[self.atk_vars, :, self.fct_input_len:self.fct_input_len + self.pattern_len] = \
-                self.target_pattern + slice[self.atk_vars, :, self.fct_input_len - self.trigger_len - 1].unsqueeze(-1)
+            target_pattern = self._target_pattern_for(len(self.target_vars))
+            slice[self.target_vars, :, self.fct_input_len:self.fct_input_len + self.pattern_len] = \
+                target_pattern + slice[self.target_vars, :, self.fct_input_len - self.trigger_len - 1].unsqueeze(-1)
 
-            # mimic the soft identification, i.e., the input and output only contain a part of the trigger and pattern
             batch_inputs_bkd = [slice[..., i:i + self.fct_input_len] for i in range(self.pattern_len)]
             batch_labels_bkd = [slice[..., i + self.fct_input_len:i + self.fct_input_len + self.fct_output_len].detach()
                                 for i in range(self.pattern_len)]
@@ -282,7 +266,6 @@ class Attacker:
             batch_labels_bkd = batch_labels_bkd[:, :, 0, :]
             batch_inputs_bkd = self.dataset.normalize(batch_inputs_bkd)
 
-            # calculate eta in the soft identification to reweight the loss
             loss_decay = (self.pattern_len - torch.arange(0, self.pattern_len, dtype=torch.float32).to(
                 self.device)) / self.pattern_len
 
@@ -292,11 +275,7 @@ class Attacker:
 
             if use_timestamps:
                 batch_x_mark = [tgr_timestamps[slice_id][i:i + self.fct_input_len] for i in range(self.pattern_len)]
-                batch_y_mark = [
-                    tgr_timestamps[slice_id][i + self.fct_input_len:i + self.fct_input_len + self.fct_output_len] for i
-                    in range(self.pattern_len)]
                 batch_x_mark = torch.stack(batch_x_mark, dim=0)
-                batch_y_mark = torch.stack(batch_y_mark, dim=0)
             else:
                 batch_x_mark = torch.zeros(batch_inputs_bkd.shape[0], batch_inputs_bkd.shape[1], 4).to(self.device)
 
@@ -304,10 +283,10 @@ class Attacker:
             outputs_bkd = net(batch_inputs_bkd, batch_x_mark, x_des, None)
             outputs_bkd = self.dataset.denormalize(outputs_bkd)
 
-            loss_bkd = F.mse_loss(outputs_bkd[:, :, self.atk_vars], batch_labels_bkd[:, :, self.atk_vars],
+            loss_bkd = F.mse_loss(outputs_bkd[:, :, self.target_vars], batch_labels_bkd[:, :, self.target_vars],
                                   reduction='none')
             loss_bkd = torch.mean(loss_bkd, dim=(1, 2))
-            loss_bkd = torch.sum(loss_bkd * loss_decay)  # reweight the loss
+            loss_bkd = torch.sum(loss_bkd * loss_decay)
             loss_norm = torch.abs(torch.sum(perturbations, dim=1)).mean()
             loss = loss_bkd + self.lam_norm * loss_norm
 
