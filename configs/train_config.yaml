@@ -17,3 +17,14 @@ Train:
     alpha_t: 0.03  # temporal_poison_rate
     epsilon: 0.2
     hidden_dim: 64  # hidden_dim for the trigger generator
+
+    # TDBA branch options. Keep attack_mode: backtime to reproduce original behavior.
+    attack_mode: tdba
+    tdba_delay_mode: random  # fixed | random | variable
+    tdba_fixed_delay: 2
+    tdba_variable_delays: []
+    tdba_max_delay: 5
+    tdba_position_sigma: 1.0
+    tdba_offset_lambda: 0.1
+    tdba_lambda_clean: 0.1
+    tdba_use_softsign: True
