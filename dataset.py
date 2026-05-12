@@ -142,13 +142,16 @@ class AttackEvaluateSet(TimeDataset):
 
         data_bef = features[:, self.attacker.atk_vars, 0,
                    -self.attacker.trigger_len - self.attacker.bef_tgr_len:-self.attacker.trigger_len]
-        triggers = self.attacker.predict_trigger(data_bef)[0]
+        delays = self.attacker.sample_eval_delays(features.shape[0])
+        triggers = self.attacker.predict_trigger(data_bef, delays=delays)[0]
         triggers = triggers.reshape(-1, self.attacker.atk_vars.shape[0], 1, self.attacker.trigger_len)
         features[:, self.attacker.atk_vars, :, -self.attacker.trigger_len:] = triggers
 
         target = clean_target.clone().detach().to(self.device)
-        target[:, self.attacker.atk_vars, :self.attacker.pattern_len] = \
-            self.attacker.target_pattern + features[:, self.attacker.atk_vars, :, -self.attacker.trigger_len - 1]
+        for s_id in range(self.attacker.atk_vars.shape[0]):
+            delay = int(delays[0, s_id].item())
+            target[:, self.attacker.atk_vars[s_id], delay:delay + self.attacker.pattern_len] = \
+                self.attacker.target_pattern + features[:, self.attacker.atk_vars[s_id], :, -self.attacker.trigger_len - 1]
 
         features = self.normalize(features)
         if not self.use_timestamp:
