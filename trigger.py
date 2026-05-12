@@ -34,6 +34,9 @@ class TgrGCN(nn.Module):
         self.hidden_dim = config.hidden_dim
         self.output_dim = config.trigger_len
         self.init_bound = config.epsilon
+        self.pred_len = config.Dataset.num_for_predict
+        self.attack_mode = getattr(config, 'attack_mode', 'backtime')
+        self.tdba_use_softsign = getattr(config, 'tdba_use_softsign', True)
 
         self.constant_MLP = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),
@@ -48,6 +51,7 @@ class TgrGCN(nn.Module):
 
         self.conv1 = GraphConvolutionLayer(self.input_dim, self.hidden_dim)
         self.conv2 = GraphConvolutionLayer(self.hidden_dim, self.output_dim)
+        self.position_proj = nn.Linear(self.pred_len, self.output_dim, bias=False)
 
         self.sim_feats = torch.from_numpy(sim_feats).float().to(device)[atk_vars]  # (n, c)
 
@@ -58,19 +62,23 @@ class TgrGCN(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.zeros_(m.weight)
                 nn.init.uniform_(m.bias, -0.2, 0.2)
+        nn.init.xavier_uniform_(self.position_proj.weight)
 
-        # self.structure_MLP = self.structure_MLP
-        # self.constant_MLP = self.constant_MLP
+    def scale_output(self, x):
+        if self.attack_mode == 'tdba' and self.tdba_use_softsign:
+            return F.softsign(x)
+        return torch.tanh(x)
 
-    def forward(self, x, constant_alpha=0.5):
+    def forward(self, x, constant_alpha=0.5, position_guidance=None):
         """
         :param x: the normalized input of the MLP, shape: (batch_size, input_dim)
+        :param position_guidance: optional matrix with shape (pred_len, n) or (n, pred_len)
         """
         n = self.sim_feats.shape[0]
         assert x.shape[0] % n == 0, 'the batch graph size should be a multiple of the number of variables.'
         x = x.view(-1, n, self.input_dim)
         bias = self.constant_MLP(torch.zeros(x.shape[-2], x.shape[-1]).to(self.device))
-        bias = torch.tanh(bias) * self.init_bound * constant_alpha
+        bias = self.scale_output(bias) * self.init_bound * constant_alpha
 
         A = self.cal_structure()
         # symmetric normalization of the adjacency matrix
@@ -81,7 +89,15 @@ class TgrGCN(nn.Module):
         h = F.relu(h)
         perturb = self.conv2(h, A)
 
-        perturb = torch.tanh(perturb) * self.init_bound * (1 - constant_alpha)
+        if position_guidance is not None:
+            pos = position_guidance.to(self.device).float()
+            if pos.shape[0] == self.pred_len:
+                pos = pos.transpose(0, 1)
+            pos_bias = self.position_proj(pos)
+            pos_bias = torch.matmul(A, pos_bias).unsqueeze(0)
+            perturb = perturb + pos_bias
+
+        perturb = self.scale_output(perturb) * self.init_bound * (1 - constant_alpha)
         # add trigger on x[-1] (last element in history) to ensure the real-time property
         out = perturb + bias + x[..., -1:]
         return out, perturb + bias
@@ -94,9 +110,6 @@ class TgrGCN(nn.Module):
         node_num = self.sim_feats.shape[0]
         node_outs = self.structure_MLP(self.sim_feats.detach())  # (n, c)
 
-        # A = torch.matmul(node_outs, node_outs.T)  # (n, n)
-        # # print('A shape', A.shape)
-        # A = F.tanh(F.relu(A))
         # cosine similarity
         A = F.cosine_similarity(node_outs.unsqueeze(0), node_outs.unsqueeze(1), dim=-1)
         A[A < 0] *= 0
