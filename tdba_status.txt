@@ -1,0 +1,1 @@
+TDBA branch integration status: config, trigger, and dataset changes have been committed. The remaining training-loop integration needs a local patch because the remote write tool is blocking the larger attack.py replacement.
